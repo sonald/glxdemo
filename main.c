@@ -11,9 +11,11 @@
 
 static Display* display;
 
+static int dbuffered = False;
+
 static int g_width, g_height;
-static GLXContext ctx;
-static GLXWindow glxwin;
+static GLXContext ctx = 0;
+static GLXWindow glxwin = 0;
 
 static Pixmap back_pixmap = 0;
 static GLXPixmap glx_pm = 0;
@@ -47,9 +49,10 @@ static int setup_context()
         GLX_GREEN_SIZE      , 8,
         GLX_BLUE_SIZE       , 8,
         GLX_ALPHA_SIZE      , 8,
-        /*GLX_DOUBLEBUFFER    , True,*/
+        GLX_DOUBLEBUFFER    , False,
         None
     };
+    fb_attribs[13] = dbuffered;
 
     int glx_major, glx_minor;
     // FBConfigs were added in GLX version 1.3.
@@ -100,25 +103,15 @@ static int setup_context()
     glXBindTexImageEXT = (t_glx_bind) glXGetProcAddress((const GLubyte *)"glXBindTexImageEXT");
     glXReleaseTexImageEXT = (t_glx_release) glXGetProcAddress((const GLubyte *)"glXReleaseTexImageEXT");
 
-
-    GdkWindow* gdkwin = gtk_widget_get_window(top);
-    glxwin = glXCreateWindow(display, bestFbc, GDK_WINDOW_XID(gdkwin), NULL);
-
-    gdkwin = gtk_widget_get_window(ref);
-    back_pixmap = XCompositeNameWindowPixmap(display, GDK_WINDOW_XID(gdkwin));
-
-    glx_pm = glXCreatePixmap(display, bestFbc, back_pixmap, pixmap_attribs);
-
-    /*glViewport (0, 0, g_width, g_height);*/
-    glShadeModel(GL_FLAT);
     return 0;
 }
 
 static gboolean on_draw(GtkWidget* w, cairo_t* cr, gpointer data)
 {
     g_debug("%s", __func__);
-    /*glXMakeContextCurrent(display, glxwin, glxwin, ctx);*/
-    glXMakeCurrent(display, glxwin, ctx);
+    if (ctx == 0 || glxwin == 0 || glx_pm == 0) return TRUE;
+
+    glXMakeContextCurrent(display, glxwin, glxwin, ctx);
     glViewport (0, 0, g_width, g_height);
 
     GdkWindow* gdkwin = gtk_widget_get_window(w);
@@ -148,29 +141,55 @@ static gboolean on_draw(GtkWidget* w, cairo_t* cr, gpointer data)
         glTexCoord2f(0.0, 1.0); glVertex3f(-1.0, -1.0, 0.0);
     glEnd(); 
 
-    glFlush(); 
-    glXSwapBuffers(display, glxwin);
-    glXMakeCurrent(display, 0, 0);
+    if (dbuffered) glXSwapBuffers(display, glxwin);
+    else glFlush(); 
+
+    /*glXMakeCurrent(display, 0, 0);*/
     return TRUE;
 }
 
 static gboolean on_ref_configure(GtkWidget *widget, GdkEvent  *event,
                gpointer   user_data)
 {
+    g_debug("%s", __func__);
     GdkEventConfigure *gec = (GdkEventConfigure*)event;
     g_width = gec->width;
     g_height = gec->height;
     gtk_window_resize(GTK_WINDOW(top), g_width, g_height);
 
+    if (!gtk_widget_get_mapped(ref)) return TRUE;
+
     if (back_pixmap) {
         glXDestroyPixmap(display, glx_pm);
         XFreePixmap(display, back_pixmap);
-    }
-    
-    GdkWindow* gdkwin = gtk_widget_get_window(ref);
-    back_pixmap = XCompositeNameWindowPixmap(display, GDK_WINDOW_XID(gdkwin));
-    glx_pm = glXCreatePixmap(display, bestFbc, back_pixmap, pixmap_attribs);
 
+        GdkWindow* gdkwin = gtk_widget_get_window(ref);
+        back_pixmap = XCompositeNameWindowPixmap(display, GDK_WINDOW_XID(gdkwin));
+        glx_pm = glXCreatePixmap(display, bestFbc, back_pixmap, pixmap_attribs);
+    }
+
+    return TRUE;
+}
+
+static gboolean on_deleted(GtkWidget *widget, GdkEvent  *event,
+               gpointer   user_data)
+{
+    g_debug("%s", __func__);
+    gtk_main_quit();
+    return FALSE;
+}
+
+static gboolean on_ref_mapped(GtkWidget *widget, GdkEvent  *event,
+               gpointer   user_data)
+{
+    g_debug("%s", __func__);
+    if (!back_pixmap) {
+        g_assert(gtk_widget_is_visible(ref));
+        GdkWindow* gdkwin = gtk_widget_get_window(ref);
+        back_pixmap = XCompositeNameWindowPixmap(display, GDK_WINDOW_XID(gdkwin));
+        glx_pm = glXCreatePixmap(display, bestFbc, back_pixmap, pixmap_attribs);
+    }
+    return FALSE;
 }
 
 static gboolean on_ref_draw(GtkWidget* widget, cairo_t* cr, gpointer data)
@@ -210,13 +229,16 @@ int main(int argc, char* argv[])
     g_width = 400;
     g_height = 300;
 
+    if (setup_context() != 0) return -1;
+
     ref = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_default_size(GTK_WINDOW(ref), g_width, g_height);
     g_object_connect(ref,
             "signal::draw", on_ref_draw, NULL, 
             "signal::configure-event", on_ref_configure, NULL, 
+            "signal::map-event", on_ref_mapped, NULL, 
+            "signal::delete-event", on_deleted, NULL,
             NULL);
-    g_timeout_add(1000, on_timeout, NULL);
 
     gtk_widget_show_all(ref);
 
@@ -228,15 +250,21 @@ int main(int argc, char* argv[])
 
     g_object_connect(top,
             "signal::draw", on_draw, NULL, 
+            "signal::delete-event", on_deleted, NULL,
             NULL);
 
-    gtk_widget_realize(top);
-
-    if (setup_context() != 0) return -1;
-
     gtk_widget_show_all(top);
+    GdkWindow* gdkwin = gtk_widget_get_window(top);
+    glxwin = glXCreateWindow(display, bestFbc, GDK_WINDOW_XID(gdkwin), NULL);
+
+    g_timeout_add(1000, on_timeout, NULL);
     gtk_main();
 
+    if (glx_pm) {
+        glXDestroyPixmap(display, glx_pm);
+        XFreePixmap(display, back_pixmap);
+    }
+    glXDestroyContext(ctx);
     g_rand_free(rand);
 }
 
